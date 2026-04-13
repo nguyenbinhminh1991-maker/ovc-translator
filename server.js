@@ -19,7 +19,7 @@ const msal       = require('@azure/msal-node');
 
 // ─── Config validation ────────────────────────────────────────────────────────
 
-const required = ['SONIOX_API_KEY', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID', 'AZURE_REDIRECT_URI'];
+const required = ['SONIOX_API_KEY', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID', 'AZURE_REDIRECT_URI', 'AZURE_ALLOWED_GROUP_ID'];
 for (const key of required) {
     if (!process.env[key]) { console.error(`❌  ${key} is not set`); process.exit(1); }
 }
@@ -67,6 +67,40 @@ const sessionMiddleware = session({
 
 app.use(sessionMiddleware);
 
+// ─── Group membership check (Microsoft Graph) ────────────────────────────────
+//
+// Uses app-level client-credentials token so the user is never prompted for
+// extra consent.  Requires "GroupMember.Read.All" Application permission on the
+// App Registration with admin consent granted.
+
+async function checkGroupMembership(userOid) {
+    // Acquire an app token for Graph (MSAL caches it until expiry)
+    const tokenResult = await pca.acquireTokenByClientCredential({
+        scopes: ['https://graph.microsoft.com/.default'],
+    });
+
+    const response = await fetch(
+        `https://graph.microsoft.com/v1.0/users/${userOid}/checkMemberGroups`,
+        {
+            method:  'POST',
+            headers: {
+                'Authorization': `Bearer ${tokenResult.accessToken}`,
+                'Content-Type':  'application/json',
+            },
+            body: JSON.stringify({ groupIds: [process.env.AZURE_ALLOWED_GROUP_ID] }),
+        }
+    );
+
+    if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Graph API ${response.status}: ${text}`);
+    }
+
+    const data = await response.json();
+    // Returns the subset of requested IDs the user actually belongs to
+    return Array.isArray(data.value) && data.value.includes(process.env.AZURE_ALLOWED_GROUP_ID);
+}
+
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 function requireAuth(req, res, next) {
@@ -112,9 +146,23 @@ app.get('/auth/callback', async (req, res) => {
             redirectUri: REDIRECT_URI,
         });
 
-        // Extra safety: confirm account belongs to the configured tenant
+        // 1. Confirm account belongs to the configured tenant
         if (result.tenantId !== TENANT_ID) {
             return res.status(403).send('Access denied: your account is not from the authorized organization.');
+        }
+
+        // 2. Confirm account is a member of the allowed security group
+        const userOid = result.idTokenClaims?.oid;
+        if (!userOid) {
+            return res.status(500).send('Authentication error: could not determine user identity.');
+        }
+
+        const isMember = await checkGroupMembership(userOid);
+        if (!isMember) {
+            return res.status(403).send(
+                'Access denied: your account is not in the authorised group. ' +
+                'Contact your administrator to request access.'
+            );
         }
 
         req.session.user = {
