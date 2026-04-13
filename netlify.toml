@@ -1,0 +1,11 @@
+[build]
+  # Serve the frontend from the src/ directory
+  publish = "src"
+
+  # No build command needed — pure static HTML/CSS/JS
+  command = ""
+
+# WebSocket proxy — handled by the Deno edge function
+[[edge_functions]]
+  path = "/api/transcribe"
+  function = "transcribe"
