@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ovc-translator
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: SONIOX_API_KEY
+        sync: false          # you enter the value manually in the Render dashboard
+      - key: PORT
+        value: 10000         # Render's default PORT; server.js already reads process.env.PORT
