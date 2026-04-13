@@ -139,45 +139,58 @@ app.get('/auth/callback', async (req, res) => {
     if (req.query.error) {
         return res.status(401).send(`Login failed: ${req.query.error_description || req.query.error}`);
     }
+
+    // ── Step 1: exchange the auth code for tokens ─────────────────────────────
+    let result;
     try {
-        const result = await pca.acquireTokenByCode({
+        result = await pca.acquireTokenByCode({
             code:        req.query.code,
             scopes:      ['openid', 'profile', 'email'],
             redirectUri: REDIRECT_URI,
         });
-
-        // 1. Confirm account belongs to the configured tenant
-        if (result.tenantId !== TENANT_ID) {
-            return res.status(403).send('Access denied: your account is not from the authorized organization.');
-        }
-
-        // 2. Confirm account is a member of the allowed security group
-        const userOid = result.idTokenClaims?.oid;
-        if (!userOid) {
-            return res.status(500).send('Authentication error: could not determine user identity.');
-        }
-
-        const isMember = await checkGroupMembership(userOid);
-        if (!isMember) {
-            return res.status(403).send(
-                'Access denied: your account is not in the authorised group. ' +
-                'Contact your administrator to request access.'
-            );
-        }
-
-        req.session.user = {
-            name:     result.account.name,
-            username: result.account.username,
-        };
-
-        const returnTo = req.session.returnTo || '/';
-        delete req.session.returnTo;
-        res.redirect(returnTo);
-
     } catch (err) {
         console.error('[auth] acquireTokenByCode:', err.message);
-        res.status(500).send('Authentication failed. Please try again.');
+        return res.status(500).send('Authentication failed — could not exchange token. Please try again.');
     }
+
+    // ── Step 2: confirm the account belongs to the configured tenant ──────────
+    if (result.tenantId !== TENANT_ID) {
+        return res.status(403).send('Access denied: your account is not from the authorized organization.');
+    }
+
+    // ── Step 3: confirm the account is in the allowed security group ──────────
+    const userOid = result.idTokenClaims?.oid;
+    if (!userOid) {
+        return res.status(500).send('Authentication error: could not determine user identity.');
+    }
+
+    let isMember;
+    try {
+        isMember = await checkGroupMembership(userOid);
+    } catch (err) {
+        console.error('[auth] checkGroupMembership:', err.message);
+        return res.status(500).send(
+            'Authentication error: could not verify group membership. ' +
+            'Ensure the app has GroupMember.Read.All application permission with admin consent.'
+        );
+    }
+
+    if (!isMember) {
+        return res.status(403).send(
+            'Access denied: your account is not in the authorised group. ' +
+            'Contact your administrator to request access.'
+        );
+    }
+
+    // ── Step 4: create session ────────────────────────────────────────────────
+    req.session.user = {
+        name:     result.account.name,
+        username: result.account.username,
+    };
+
+    const returnTo = req.session.returnTo || '/';
+    delete req.session.returnTo;
+    res.redirect(returnTo);
 });
 
 app.get('/auth/logout', (req, res) => {
