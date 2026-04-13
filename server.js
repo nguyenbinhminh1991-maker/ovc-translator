@@ -67,55 +67,20 @@ const sessionMiddleware = session({
 
 app.use(sessionMiddleware);
 
-// ─── Group membership check (Microsoft Graph) ────────────────────────────────
+// ─── Group membership check (ID token claims) ────────────────────────────────
 //
-// Uses app-level client-credentials token so the user is never prompted for
-// extra consent.  Requires "GroupMember.Read.All" Application permission on the
-// App Registration with admin consent granted.
+// Azure AD embeds the user's security group Object IDs directly in the ID token
+// when "groups" claim is enabled in Token configuration on the App Registration.
+// No Graph API call or extra permissions needed.
+//
+// NOTE: if a user belongs to >200 groups Azure AD sends an overage indicator
+// instead of the full list. That edge case is uncommon in small/mid orgs.
 
-async function checkGroupMembership(userOid) {
-    const groupId = process.env.AZURE_ALLOWED_GROUP_ID;
-
-    // ── Step A: get an app-level Graph token via client credentials ───────────
-    let tokenResult;
-    try {
-        tokenResult = await pca.acquireTokenByClientCredential({
-            scopes: ['https://graph.microsoft.com/.default'],
-        });
-    } catch (err) {
-        throw new Error(`MSAL client-credentials failed: ${err.message}`);
-    }
-
-    if (!tokenResult?.accessToken) {
-        throw new Error('MSAL returned no access token for Graph API');
-    }
-
-    console.log(`[auth] checking group membership  user=${userOid}  group=${groupId}`);
-
-    // ── Step B: ask Graph if the user is a transitive member of the group ─────
-    // Uses transitiveMemberOf + $filter which is reliable for all group types.
-    // ConsistencyLevel:eventual is required when using $count/$filter on directory objects.
-    const url =
-        `https://graph.microsoft.com/v1.0/users/${userOid}/transitiveMemberOf` +
-        `?$filter=id eq '${groupId}'&$count=true`;
-
-    const response = await fetch(url, {
-        headers: {
-            'Authorization':    `Bearer ${tokenResult.accessToken}`,
-            'ConsistencyLevel': 'eventual',
-        },
-    });
-
-    if (!response.ok) {
-        const text = await response.text();
-        console.error(`[auth] Graph API error  status=${response.status}  body=${text}`);
-        throw new Error(`Graph API ${response.status}: ${text}`);
-    }
-
-    const data = await response.json();
-    const count = data['@odata.count'] ?? data.value?.length ?? 0;
-    console.log(`[auth] group membership result  count=${count}`);
-    return count > 0;
+function checkGroupMembership(idTokenClaims) {
+    const groupId   = process.env.AZURE_ALLOWED_GROUP_ID;
+    const userGroups = idTokenClaims?.groups ?? [];
+    console.log(`[auth] token groups=${JSON.stringify(userGroups)}  required=${groupId}`);
+    return userGroups.includes(groupId);
 }
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
@@ -176,24 +141,7 @@ app.get('/auth/callback', async (req, res) => {
     }
 
     // ── Step 3: confirm the account is in the allowed security group ──────────
-    const userOid = result.idTokenClaims?.oid;
-    if (!userOid) {
-        return res.status(500).send('Authentication error: could not determine user identity.');
-    }
-
-    let isMember;
-    try {
-        isMember = await checkGroupMembership(userOid);
-    } catch (err) {
-        console.error('[auth] checkGroupMembership failed:', err.message);
-        // Surface the Graph HTTP status in the browser so it's diagnosable without Render logs
-        const graphStatus = err.message.match(/Graph API (\d+)/)?.[1] ?? '???';
-        return res.status(500).send(
-            `Authentication error: group membership check failed (Graph HTTP ${graphStatus}). ` +
-            `Check Render logs for details. Most likely cause: ` +
-            `GroupMember.Read.All admin consent not yet granted in Azure Portal.`
-        );
-    }
+    const isMember = checkGroupMembership(result.idTokenClaims);
 
     if (!isMember) {
         return res.status(403).send(
